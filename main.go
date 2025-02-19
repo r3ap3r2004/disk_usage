@@ -31,7 +31,7 @@ type DirTree struct {
 }
 
 // buildDirTree recursively scans the directory at the given path and builds a DirTree.
-func buildDirTree(path string) (*DirTree, error) {
+func buildDirTree(path string, mmin int) (*DirTree, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, err
@@ -43,29 +43,35 @@ func buildDirTree(path string) (*DirTree, error) {
 		Size: 0,
 	}
 
-	// Open directory.
-	dirEntries, err := os.ReadDir(path)
+	entries, err := os.ReadDir(path)
 	if err != nil {
-		// If we cannot read the directory, return the tree with size 0.
 		return tree, nil
 	}
 
-	for _, entry := range dirEntries {
+	now := time.Now()
+
+	for _, entry := range entries {
 		fullPath := filepath.Join(path, entry.Name())
 		if entry.IsDir() {
-			// Recursively build the subdirectory tree.
-			subTree, err := buildDirTree(fullPath)
+			subTree, err := buildDirTree(fullPath, mmin)
 			if err == nil {
 				tree.SubDirs = append(tree.SubDirs, subTree)
 				tree.Size += subTree.Size
 			}
 		} else {
-			// For files (or symlinks, etc.) get the full file info.
 			fileInfo, err := entry.Info()
-			if err == nil {
-				tree.Files = append(tree.Files, fileInfo)
-				tree.Size += fileInfo.Size()
+			if err != nil {
+				continue
 			}
+			// If mmin is greater than 0 then filter out files older than mmin minutes.
+			if mmin > 0 {
+				minutesOld := now.Sub(fileInfo.ModTime()).Minutes()
+				if minutesOld >= float64(mmin) {
+					continue
+				}
+			}
+			tree.Files = append(tree.Files, fileInfo)
+			tree.Size += fileInfo.Size()
 		}
 	}
 
@@ -87,7 +93,7 @@ func humanizeBytes(s int64) string {
 }
 
 // fileDetails returns a slice of strings with ls -al style details for a file.
-func fileDetails(info os.FileInfo, fullPath string) []string {
+func fileDetails(info os.FileInfo) []string {
 	// Permissions.
 	perms := info.Mode().String()
 
@@ -111,7 +117,7 @@ func fileDetails(info os.FileInfo, fullPath string) []string {
 	}
 
 	// File size.
-	size := fmt.Sprintf("%s", humanizeBytes(info.Size()))
+	size := humanizeBytes(info.Size())
 
 	// Modified time (format similar to ls).
 	modTime := info.ModTime().Format("Jan 02 15:04")
@@ -146,7 +152,7 @@ func updateFileTable(table *tview.Table, dt *DirTree) {
 
 	// Add file rows.
 	for r, file := range files {
-		details := fileDetails(file, filepath.Join(dt.Path, file.Name()))
+		details := fileDetails(file)
 		for c, d := range details {
 			cell := tview.NewTableCell(d).
 				SetAlign(tview.AlignLeft)
@@ -158,6 +164,8 @@ func updateFileTable(table *tview.Table, dt *DirTree) {
 func main() {
 	// Allow passing the base directory as a command-line argument.
 	rootPath := "."
+	mmin := 0 // 0 means no filtering
+
 	if len(os.Args) > 1 {
 		rootPath = os.Args[1]
 		// Simple tilde expansion if the path starts with '~'
@@ -165,6 +173,13 @@ func main() {
 			if usr, err := user.Current(); err == nil {
 				rootPath = filepath.Join(usr.HomeDir, rootPath[1:])
 			}
+		}
+	}
+
+	// Optionally, a second argument: mmin (in minutes)
+	if len(os.Args) > 2 {
+		if val, err := strconv.Atoi(os.Args[2]); err == nil {
+			mmin = val
 		}
 	}
 
@@ -202,19 +217,16 @@ func main() {
 	var rootTree *DirTree
 	var scanErr error
 	go func() {
-		rootTree, scanErr = buildDirTree(rootPath)
+		rootTree, scanErr = buildDirTree(rootPath, mmin)
 		scanApp.Stop()
+		ticker.Stop()
+		close(spinnerDone)
 	}()
 
 	// Set the scanning view as the initial root.
 	if err := scanApp.SetRoot(scanTextView, true).SetFocus(scanTextView).Run(); err != nil {
 		panic(err)
 	}
-
-	// Wait for scanning to complete.
-	// <-doneChan
-	ticker.Stop()
-	close(spinnerDone)
 
 	if scanErr != nil {
 		app.Stop()
@@ -238,8 +250,7 @@ func main() {
 	treeView.SetTitle("Directories")
 
 	// Recursive function to add child nodes.
-	var addTreeNodes func(tn *tview.TreeNode, dt *DirTree)
-	addTreeNodes = func(tn *tview.TreeNode, dt *DirTree) {
+	addTreeNodes := func(tn *tview.TreeNode, dt *DirTree) {
 		// Sort subdirectories by size (largest first).
 		sort.Slice(dt.SubDirs, func(i, j int) bool {
 			return dt.SubDirs[i].Size > dt.SubDirs[j].Size
@@ -350,7 +361,7 @@ func main() {
 					return event
 				}
 				// Show the deletion confirmation modal.
-				showMultiDeleteModal(app, mainFlex, dt.Path, filesToDelete, func(deleted bool) {
+				showMultiDeleteModal(app, dt.Path, filesToDelete, func(deleted bool) {
 					if deleted {
 						// Remove deleted files from dt.Files.
 						var newFiles []os.FileInfo
@@ -423,7 +434,7 @@ func main() {
 					return event
 				}
 				// Re-scan the directory for updated disk usage.
-				newDt, err := buildDirTree(dt.Path)
+				newDt, err := buildDirTree(dt.Path, mmin)
 				if err != nil {
 					// (Optional) You might display an error message here.
 					return event
@@ -568,47 +579,7 @@ func showHelpModal(app *tview.Application, mainFlex tview.Primitive) {
 	})
 }
 
-// showDeleteModal displays a confirmation dialog for deleting a file.
-// If the user confirms (via 'y', Enter, or clicking "Yes"), the callback is invoked with deleted==true.
-// Otherwise, callback(false) is called.
-func showDeleteModal(app *tview.Application, mainFlex tview.Primitive, fullPath string, callback func(deleted bool)) {
-	text := fmt.Sprintf("Do you really want to delete\n%s?", fullPath)
-	modal := tview.NewModal()
-	modal.SetBackgroundColor(tcell.ColorBlack)
-	modal.SetText("[white]" + text).
-		AddButtons([]string{"Yes", "No"}).
-		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			if buttonLabel == "Yes" {
-				// Attempt deletion.
-				if err := os.Remove(fullPath); err != nil {
-					// (Optional) Handle the error, e.g. show an error message.
-				}
-				callback(true)
-			} else {
-				callback(false)
-			}
-		})
-	modal.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyRune {
-			switch event.Rune() {
-			case 'y', 'Y':
-				if err := os.Remove(fullPath); err != nil {
-					// (Optional) Handle error.
-				}
-				callback(true)
-				return nil
-			default:
-				callback(false)
-				return nil
-			}
-		}
-		return event
-	})
-	app.SetRoot(modal, true)
-}
-
-// showMultiDeleteModal displays a confirmation dialog listing all selected files.
-func showMultiDeleteModal(app *tview.Application, mainFlex tview.Primitive, basePath string, fileNames []string, callback func(deleted bool)) {
+func showMultiDeleteModal(app *tview.Application, basePath string, fileNames []string, callback func(deleted bool)) {
 	text := fmt.Sprintf("Do you really want to delete %d files?\n", len(fileNames))
 	for _, name := range fileNames {
 		text += fmt.Sprintf(" - %s\n", name)
