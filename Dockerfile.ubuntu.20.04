@@ -1,0 +1,23 @@
+# Start from the latest golang base image
+FROM ubuntu:focal-20231211 as builder
+
+# install golang
+RUN apt-get update && apt-get install curl -y
+RUN curl -OL https://go.dev/dl/go1.23.0.linux-amd64.tar.gz
+RUN tar -C /usr/local -xvf go1.23.0.linux-amd64.tar.gz
+ENV PATH="${PATH}:/usr/local/go/bin"
+
+# Set the Current Working Directory inside the container
+WORKDIR /app
+
+# Copy go mod and sum files
+COPY go.mod go.sum ./
+
+# Download all dependencies
+RUN go mod download
+
+# Copy the source from the current directory to the Working Directory inside the container
+COPY . .
+
+RUN GOOS=linux GOARCH=amd64 go build -o ./bin/disk-usage-ubuntu-20-04 ./main.go
+
